@@ -4,8 +4,10 @@ import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.Intent;
 import android.database.Cursor;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.support.v7.app.AppCompatActivity;
@@ -19,60 +21,147 @@ import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.TextView;
+import android.widget.Toast;
 
-import java.io.BufferedOutputStream;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.CharArrayWriter;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.nio.channels.WritableByteChannel;
+import java.security.InvalidKeyException;
+import java.security.InvalidParameterException;
 import java.util.Scanner;
+import java.util.concurrent.CancellationException;
 
-public class MainActivity extends AppCompatActivity {
+interface MyDelegate {
+    void updateProgress(int progress);
+    void onFinishied();
+}
+public class MainActivity extends AppCompatActivity implements MyDelegate {
 
+    MyDelegate myDelegate =this;
+
+    //For ContentResolver / ActivityResult
     private static final int CODE_READ = 42;
-    private static final int CODE_WRITE = 43;
-    private static final int CODE_TREE = 44;
 
+    //Message Max Length
+    private static final int MSG_MAX = 1024*1024*10;
+
+    //UIs
     ProgressBar mProgressBar;
     EditText mEditTextIp;
     EditText mEditTextPort;
-//    EditText mEditTextOutputFilePath;
     TextView mTextViewInputFilePath;
-    TextView mTextViewOutputDir;
-    TextView mTextViewOutputFilename;
+    EditText mEditTextOutputFilename;
     TextView mTextViewDebugOutput;
 
+    //Enumerable for Crypt
     enum Crypt{
-        encrypt, decrypt, none;
+        Encrypt, Decrypt, None;
         public static Crypt fromId(int id){
             switch(id) {
-                case R.id.radioEncrypt: return encrypt;
-                case R.id.radioDecrypt: return decrypt;
-                default: return none;
+                case R.id.radioEncrypt: return Encrypt;
+                case R.id.radioDecrypt: return Decrypt;
+                default: return None;
             }
+        }
+        public static Crypt fromByte(byte b) {
+            switch(b) {
+                case 0: return Crypt.Encrypt;
+                case 1: return Crypt.Decrypt;
+                default: return Crypt.None;
+            }
+        }
+        public byte toByte() throws InvalidKeyException{
+            if(this==Encrypt) return 0;
+            else if(this==Decrypt) return 1;
+            else throw new InvalidKeyException("Crypt value is none");
         }
     }
     Crypt mCrypt;
-
+    byte mShift=1;
     String mIp;
     int mPort;
     Uri mInputUri;
-    Uri mOutputDirUri;
-    Uri mOutputUri;
     String mOutputFileName;
 
+    //Async Task
     MyClientTask mMyClientTask=null;
+
+    //Message
+    private class Message {
+        public Crypt mCrypt;
+        public byte mShift;
+        public int mLength;
+        public String mData;
+        public Message(Crypt crypt, byte shift, String data) {
+            mCrypt=crypt;
+            mShift=shift;
+            mData=data;
+            mLength=data.length();
+        }
+        public Message(byte[] bytes) {
+            ByteBuffer buffer = ByteBuffer.wrap(bytes);
+            mCrypt = Crypt.fromByte(buffer.get());
+            mShift = buffer.get();
+            buffer.getShort();
+            mLength=buffer.getInt();
+            if(mLength>MSG_MAX-9 || mLength<0) {
+                int t = mLength;
+                mLength=-1;
+                throw new InvalidParameterException("Invalid Length : " + t);
+            }
+
+            try {
+                byte[] dataArray = new byte[buffer.remaining()];
+                buffer.get(dataArray);
+                mData = new String(dataArray,"US-ASCII");
+            } catch (UnsupportedEncodingException e) {
+                e.printStackTrace();
+            }
+        }
+        //Build bytes of messages
+        public byte[] getBytes() {
+            ByteBuffer buffer = ByteBuffer.allocate(8+mLength);
+            try {
+                if(mLength>MSG_MAX-9 || mLength < 0)
+                    throw new InvalidParameterException("Too long length : " + mLength);
+                buffer.put(mCrypt.toByte());
+                buffer.put(mShift);
+                buffer.putShort((short)-1);
+                buffer.putInt(mLength); //Endian already concerened
+                buffer.put(mData.getBytes());
+                return buffer.array();
+            } catch (InvalidKeyException e) {
+                e.printStackTrace();
+                return null;
+            }
+        }
+        public String toString() {
+            StringBuilder builder= new StringBuilder();
+            builder.append(String.format("crypt : " + mCrypt.toString() + "\n"));
+            builder.append(String.format("shift : " + mShift + "\n"));
+            builder.append(String.format("length : " + mLength + "\n"));
+            builder.append(String.format("data : " + mData + "\n"));
+            return builder.toString();
+        }
+    }
+
+    @Override
+    public void updateProgress(int progress) {
+        mProgressBar.setProgress(progress);
+    }
+
+    @Override
+    public void onFinishied() {
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -82,10 +171,8 @@ public class MainActivity extends AppCompatActivity {
         mProgressBar=(ProgressBar)findViewById(R.id.progress);
         mEditTextIp=(EditText)findViewById(R.id.editIp);
         mEditTextPort=(EditText)findViewById(R.id.editPort);
-//        mEditTextOutputFilePath=(EditText)findViewById(R.id.editOutputPath);
         mTextViewInputFilePath=(TextView)findViewById(R.id.textInputFilePath);
-        mTextViewOutputDir=(TextView)findViewById(R.id.textOutputDir);
-        mTextViewOutputFilename=(TextView)findViewById(R.id.textOutputName);
+        mEditTextOutputFilename=(EditText)findViewById(R.id.editOutputName);
         mTextViewDebugOutput=(TextView)findViewById(R.id.textDebugOutput);
 
         mEditTextIp.addTextChangedListener(new TextWatcher() {
@@ -104,7 +191,7 @@ public class MainActivity extends AppCompatActivity {
                 try{
                     mPort = Integer.valueOf(s.toString());
                 }catch(NumberFormatException e) {
-                    mPort=0;
+                    mPort=-1;
                 }
             }
         });
@@ -128,64 +215,41 @@ public class MainActivity extends AppCompatActivity {
         findViewById(R.id.btnConnect).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                Log.d("connectBtn","Ip : " + mIp);
-                Log.d("connectBtn","port : " + mPort);
-                if(mInputUri==null) Log.d("connectBtn", "Input Uri : null");
-                else Log.d("connectBtn", "Input Uri : " + mInputUri.toString());
-                Log.d("connectBtn","output File Path : " + mOutputFileName);
-                Log.d("connectBtn","input : " + readInput());
-
-//                if(mOutputUri!=null) {
-                if(mMyClientTask!=null) {
-                    if(mMyClientTask.getStatus()==AsyncTask.Status.RUNNING) {
-                        mMyClientTask.cancel(true);
-                    }
-                    mMyClientTask=null;
-                    Log.d("connectBtn","task stopped");
+                if(mInputUri==null) {
+                    Log.d("connectBtn","input : none");
+                    Toast.makeText(getApplicationContext(),"No input file",Toast.LENGTH_SHORT).show();
+                    return;
                 }
-                    if(mMyClientTask==null) {
-                        mMyClientTask=new MyClientTask(mIp,mPort);
-                        mMyClientTask.execute();
-                    }
-//                    ContentResolver cr=getContentResolver();
-//
-//                    try(OutputStream os = cr.openOutputStream(mOutputUri,"w") ){
-//                        os.write("Great job".getBytes());
-//                    } catch (FileNotFoundException e) {
-//                        e.printStackTrace();
-//                    } catch (IOException e) {
-//                        e.printStackTrace();
-//                    }
-//                }
+                if(mMyClientTask!=null) {
+                    if(mMyClientTask.getStatus()==AsyncTask.Status.RUNNING)
+                        mMyClientTask.cancel(true);
+                    mMyClientTask=null;
+                    Log.d("connectBtn","task clearing");
+                }
+                if(mMyClientTask==null) {
+                    String sendingData = readInput();
+                    mMyClientTask=new MyClientTask(mIp,mPort,mCrypt,mShift,sendingData, myDelegate);
+                    mProgressBar.setMax(sendingData.length());
+                    mProgressBar.setProgress(0);
+                    mMyClientTask.execute();
+                }
             }
         });
-//        findViewById(R.id.btnOutputDir).setOnClickListener(new View.OnClickListener() {
-//            @Override
-//            public void onClick(View v) {
-//                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-//                startActivityForResult(Intent.createChooser(intent, "Output Directory"), CODE_TREE);
-//            }
-//        });
-        findViewById(R.id.btnOutputFile).setOnClickListener(new View.OnClickListener() {
+        mEditTextOutputFilename.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void afterTextChanged(Editable s) {}
             @Override
-            public void onClick(View v) {
-                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("text/plain");
-                intent.putExtra(Intent.EXTRA_TITLE, "newFileName__(for_overwriting_tap_that_again).txt");
-                startActivityForResult(intent,CODE_WRITE);
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                mOutputFileName=String.valueOf(s);
             }
         });
 
         mEditTextIp.setText("143.248.56.16");
         mEditTextPort.setText("4000");
-//        mEditTextIp.setText("192.168.0.3");
-//        mEditTextPort.setText("2012");
         ((RadioButton)findViewById(R.id.radioEncrypt)).setChecked(true);
-//        mEditTextOutputFilePath.setText("output.txt");
+        mCrypt=Crypt.Encrypt;
         mTextViewInputFilePath.setText("None"); mInputUri=null;
-        mTextViewOutputDir.setText("None"); mOutputDirUri=null;
-        mTextViewOutputFilename.setText("None"); mOutputFileName=null;
+        mEditTextOutputFilename.setText("output.txt");
     }
 
     @Override
@@ -200,14 +264,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if(requestCode==CODE_READ) {
-//                if(mInputUri!=null) {
-//                    cr.releasePersistableUriPermission(mInputUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-//                    Log.d("activityResult","released " + mInputUri);
-//                }
-
-//                cr.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             mInputUri=uri;
-//                mTextViewInputFilePath.setText(mInputUri.getPath());
             Cursor cursor=cr.query(mInputUri,null,null,null,null,null);
             if(cursor!=null && cursor.moveToFirst()) {
                 mTextViewInputFilePath.setText(cursor.getString(cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)));
@@ -215,30 +272,9 @@ public class MainActivity extends AppCompatActivity {
             }
             cursor.close();
         }
-        if(requestCode==CODE_TREE && resultCode== Activity.RESULT_OK) {
-            Uri docUri= DocumentsContract.buildDocumentUriUsingTree(uri,
-                    DocumentsContract.getTreeDocumentId(uri));
-
-            try(Cursor docCursor = cr.query(docUri, new String[]{
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_MIME_TYPE}, null, null, null)){
-                if(docCursor!=null && docCursor.moveToFirst()) {
-                    Log.d("activityResult", docCursor.getString(docCursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)));
-                    mOutputDirUri=uri;
-                    mTextViewOutputDir.setText(docCursor.getString(docCursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)));
-                }
-            }
-        }
-        if(requestCode==CODE_WRITE && resultCode==Activity.RESULT_OK) {
-            mOutputUri=uri;
-            try(Cursor cursor=cr.query(mOutputUri,null,null,null,null,null)) {
-                if (cursor != null && cursor.moveToFirst()) {
-                    mTextViewOutputFilename.setText(cursor.getString(cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)));
-                    Log.d("activityResult", mTextViewOutputFilename.getText().toString());
-                }
-            }
-        }
     }
 
+    //Read content of a file with mInputFileUri
     private String readInput() {
         if(mInputUri==null) {
             Log.d("readInput","uri is null");
@@ -258,67 +294,158 @@ public class MainActivity extends AppCompatActivity {
         return readContent;
     }
 
-    public class MyClientTask extends AsyncTask<Void, Void, Void> {
+    //AsyncTask for Network connection
+    public class MyClientTask extends AsyncTask<Void, Void, String> {
         String mAddr;
         int mPort;
-        String mResponse;
-        MyClientTask(String addr, int port) {
+        Crypt mCrypt;
+        byte mShift;
+        String mData;
+
+        MyDelegate mDelegate;
+
+        MyClientTask(String addr, int port, Crypt crypt, byte shift, String data, MyDelegate delegate) {
             mAddr=addr;
             mPort=port;
+            mCrypt=crypt;
+            mShift=shift;
+            mData=data;
+            mDelegate=delegate;
         }
 
         @Override
-        protected Void doInBackground(Void... params) {
-            CharArrayWriter chars=new CharArrayWriter();
-            try (Socket socket = new Socket(mAddr,mPort)){
-                Log.d("myClientTask","after Socket");
-                String data = "aaaa";
+        protected String doInBackground(Void... params) {
+            int inputLength = mData.length();
+            StringBuilder responseBuilder = new StringBuilder();
+            try {
+                int remainedLength, pos;
+                while(true) { //create and send messages until all mData sent.
+                    pos = responseBuilder.length();
+                    mDelegate.updateProgress(pos);
+                    remainedLength = inputLength - pos;
+                    if(remainedLength <= 0)
+                        break;
+                    int sendingMessageDataLength = remainedLength > (MSG_MAX - 8) ? (MSG_MAX - 8) : remainedLength;
+//                    Log.d("myClientTask","responseBuilder : " + responseBuilder.toString());
 
-                OutputStream os = socket.getOutputStream();
-//                try(BufferedOutputStream bos = new BufferedOutputStream(os)) {
-//                    bos.write(data.getBytes());
-//                    bos.flush();
-//                }
-//                os.write(data.getBytes());
+                    Message sendingMessage = new Message(mCrypt, mShift, mData.substring(pos, pos + sendingMessageDataLength));
+                    ByteBuffer receivedBuffer = ByteBuffer.allocate(8 + sendingMessageDataLength);
+                    try (Socket socket = new Socket(mAddr, mPort)) {
+                        {// Send
+                            try {
+                                OutputStream os = socket.getOutputStream();
+                                os.write(sendingMessage.getBytes());
+                                Log.d("myClientTask", "sent");
+                            } catch (SocketException e) {
+                                Log.d("myClientTask", "sending Exception");
+                                throw e;
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
+                        }
 
-
-//                WritableByteChannel channel = Channels.newChannel(os);
-                ByteBuffer byteBuffer = ByteBuffer.allocate(8+data.length());
-                byteBuffer.put((byte)0);
-                byteBuffer.put((byte)1);
-                byteBuffer.putShort((short)-1);
-                byteBuffer.putInt(data.length());
-                byteBuffer.put(data.getBytes());
-                os.write(byteBuffer.array());
-//                channel.write(byteBuffer);
-                StringBuilder stringBuilder = new StringBuilder();
-                byte[] buffer = new byte[30];
-                int bytesRead;
-                InputStream inputStream = socket.getInputStream();
-                while ((bytesRead = inputStream.read(buffer))!=-1) {
-                    for(Byte by : buffer) {
-//                        Log.d("received", String.valueOf(by));
-//                        stringBuilder.append(by.toString());
-                        chars.write((char)by.byteValue());
+                        {// Recv Response
+                            boolean isHeaderReceived=false;
+                            int receivedMessageBytesLength = 0;
+                            socket.setSoTimeout(100);
+                            try (InputStream inputStream = socket.getInputStream()) {
+                                byte[] bytes = new byte[1024];
+                                while (true) {
+                                    if (isCancelled())
+                                        throw new CancellationException("MyClientTask cancelled");
+                                    try {
+                                        int bytesRead = inputStream.read(bytes);
+                                        Log.d("received", "bytes Read : " + bytesRead);
+                                        if (bytesRead >= 0) {
+                                            for (int i = 0; i < bytesRead; i++)
+                                                receivedBuffer.put(bytes[i]);
+                                            receivedMessageBytesLength += bytesRead;
+                                        } else {
+                                            Log.d("connection", "read failed. Connection lost");
+                                            break;
+                                        }
+                                    } catch (SocketTimeoutException e) {
+                                        Log.d("connection", "timeout");
+                                    } catch (IOException e) {
+                                        e.printStackTrace();
+                                    }
+                                }
+                                if (isHeaderReceived == false && receivedMessageBytesLength >= 8) // Header (8 bytes) received.
+                                    isHeaderReceived= true;
+                            } catch (IOException e) { // getInputStream fails
+                                e.printStackTrace();
+                            }
+                            if(isCancelled())
+                                throw new CancellationException("MyClientTask cancelled");
+                            if(isHeaderReceived==true) {
+                                byte[] receivedBytes = new byte[receivedMessageBytesLength];
+                                receivedBuffer.rewind();
+                                receivedBuffer.get(receivedBytes, 0, receivedMessageBytesLength);
+                                Message receivedMessage = new Message(receivedBytes);
+//                                Log.d("remainedLength",remainedLength+"");
+//                                Log.d("receivedMessage Length",receivedMessage.mLength+"");
+                                if(remainedLength == receivedMessage.mLength) {
+                                    Log.d("myClientTask", "length matched");
+                                    responseBuilder.append(receivedMessage.mData);
+                                }
+                            }
+                            else {
+                                Log.d("myClientTask","header receiving failed");
+                            }
+                        }
+                    } catch (SocketTimeoutException e) {
+                        Log.d("connection", "connection timeout");
+                    } catch (SocketException e) {
+                        e.printStackTrace();
+                        Log.d("myClientTask", "socket exception");
+                    } catch (UnknownHostException e) {
+                        e.printStackTrace();
+                    } catch (IOException e) { // Socket constructor failed
+                        e.printStackTrace();
                     }
                 }
-                Log.d("received","bytes Read : " + bytesRead);
-//                Log.d("received",String.valueOf(buffer));
-//                Log.d("received",stringBuilder.substring(9).toString());
-            } catch (UnknownHostException e) {
-                e.printStackTrace();
-            } catch(SocketException e){
-                e.printStackTrace();
-            } catch(IOException e) {
-                e.printStackTrace();
+            } catch (CancellationException e) {
+                Log.d("myClientTask","Cancelled");
+                return null;
             }
-            finally {
-                if(chars.size()>0) {
-                    Log.d("received",chars.toString().substring(8));
+            Log.d("myClientTask","end");
+            return responseBuilder.toString();
+        }
+
+        @Override
+        protected void onPostExecute(String resultString) {
+            if(resultString==null)
+                return;
+            Log.d("myClientTask","result : " + resultString);
+//            Toast.makeText(getApplicationContext(),"Response Saved",Toast.LENGTH_SHORT);
+
+            Toast.makeText(getApplicationContext(),"Response Saved to " + mOutputFileName,Toast.LENGTH_SHORT).show();
+            if(mOutputFileName!=null) {
+                String dirname = Environment.getExternalStorageDirectory().getAbsolutePath();
+                File dir = new File(dirname);
+                dir.mkdirs();
+                File outputFile = new File(dir,mOutputFileName);
+//            String outputFilePath = dirname + "/" + mOutputFileName;
+
+                try {
+                    if (!outputFile.exists()) {
+                        outputFile.createNewFile();
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
                 }
-                Log.d("myClientTask","end");
+                try(FileOutputStream fos = new FileOutputStream(outputFile,false)) {
+                    fos.write(resultString.getBytes());
+                } catch (FileNotFoundException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                Log.d("output",outputFile.getAbsolutePath());
+                MediaScannerConnection.scanFile(getApplicationContext(),
+                        new String[]{outputFile.getAbsolutePath()},null,null);
             }
-            return null;
+            super.onPostExecute(null);
         }
     }
 }
